@@ -233,7 +233,7 @@ Enterprise Knowledge Copilot 是一款**面向企业内部使用的、具备权�
 
 - **Single Agent**: 唯一决策主体，负责理解问题，选择工具，汇总答案
 - **Workflow(状态机)**: 显示控制执行路径、重试预算、停止条件与降级策略，保证可控，可复现，可调试
-- **ReAct-styple tool use**: 在"工具调用节点"内部, Agent以"决策 → 调用 → 观察"的循环获取证据, 但循环被workflow的step limit, no-new-info等规则限制
+- **ReAct-style tool use**: 在"工具调用节点"内部, Agent以"决策 → 调用 → 观察"的循环获取证据, 但循环被workflow的step limit, no-new-info等规则限制
 
 
 
@@ -256,4 +256,490 @@ Enterprise Knowledge Copilot 是一款**面向企业内部使用的、具备权�
    - 接口: upload, chat
    - 日志: tool trace, retrieval 命中, 延迟，错误， stop_reason
    - 评估: 离线问题集 + 指标(Recal@k, Correctness)
+
+
+
+## 4.2 State Schema
+
+- append-only
+
+  - messages: list[BaseMessage]
+
+  - trace_steps: list[dict]
+
+    ```json
+    {
+      // 每一步 trace 的唯一标识（递增或 UUID 都行）
+      "step_id": "step_0001",
+    
+      // 发生时间（毫秒时间戳）
+      "ts_ms": 1735267200123,
+    
+      // 节点名：Preprocess / Route / DocRAGTool / SQLTool / Validate / Synthesize ...
+      "node": "DocRAGTool",
+    
+      // 节点内部动作名：方便同一节点区分不同动作
+      "action": "retrieve_and_pack",
+    
+      // 执行状态
+      "status": "ok", // "ok" | "error" | "skipped"
+    
+      // 节点耗时（ms）
+      "timing_ms": 186,
+    
+      // 本步的核心输入摘要（不要塞大文本，避免日志爆炸/泄露）
+      "in": {
+        "q": "k8s rolling update default strategy", // 归一化后的 query（可截断）
+        "route": "DOC",                             // 可选：当时的 route
+        "user": "u_123"                             // 可选：用户 id（或哈希）
+      },
+    
+      // 本步的核心输出摘要
+      "out": {
+        "evidence_added": 3,                        // 新增了多少条 evidence
+        "note": "retrieved=8 packed=3"              // 一句话总结（可选）
+      },
+    
+      // 如果是 Tool Node，记录工具名；非 Tool Node 可省略
+      "tool": "rag_retriever", // 例如 "rag_retriever" | "sql_tool"
+    
+      // 如发生错误，填简要错误；没有错误可省略
+      "err": {
+        "type": "ValidationError",
+        "msg": "tenant/org filter is required"
+      }
+    }
+    
+    ```
+
+    
+
+  - evidence_items: list[dict]
+
+    ```json
+    {
+      // 证据唯一标识：建议可复现（source + id + hash）
+      "evidence_id": "doc:deploy_spec_v3:chunk_001:a1b2c3d4",
+    
+      // 证据类型：文档片段 or SQL结果
+      "type": "doc_chunk", // "doc_chunk" | "sql_result"
+    
+      // 证据正文：尽量是“可引用的最小片段”
+      // 注意：不要太长；可在入库时截断，比如 500~1200 chars
+      "text": "Deployment rolling update 默认策略为 ...",  // 对于SQL, 存储结果摘要 + top rows
+    
+      // 用于排序/置信度的分数（doc检索用；SQL可为 null 或 1.0）
+      "score": 0.78,
+    
+      // 证据来源信息：用于 UI 展示与追溯
+      "source": {
+        // 文档场景
+        "doc_id": "deploy_spec_v3",         // 内部文档ID（或路径）
+        "title": "Internal Deployment Spec",
+        "page": 3,                          // PDF 页码（可选）
+        "chunk_id": "chunk_001",            // chunk id（可选）
+        "uri": "kb://team-a/deploy/spec"    // 内部链接（可选）
+    
+        // SQL 场景（如果 type=sql_result，可改成）
+        // "db": "analytics",
+        // "table": "users",
+        // "query_id": "q_20251227_0009"
+      },
+    
+      // 权限检查结果：最小审计字段
+      "authz": {
+        "result": "allow",                  // "allow" | "deny" | "filtered"
+        "perm_snapshot_id": "perm_20251227_001"
+      },
+    
+      // 证据生成方式：便于审计（RAG/SQL/用户提供）
+      "by": "retriever", // "retriever" | "sql" | "user"
+    
+      // 可选：用于防篡改/去重（hash of text + source ids）
+      "hash": "a1b2c3d4"
+    }
+    
+    ```
+
+    在回答中，只引用evidence_id, UI通过`evidence_id`找到`evidence_item`
+
+  
+
+- 覆盖
+
+  - input: dict
+
+    ```json
+    {
+      // 原始用户问题（必填）
+      "query": "Kubernetes 中 Deployment 的 rolling update 默认策略是什么？",
+    
+      // 预处理后的 query（PreprocessNode 写入）
+      "normalized_query": "kubernetes deployment rolling update 默认策略是什么",
+    
+      // 可选：当前会话的一些轻量上下文（先别复杂化）
+      "session_id": "sess_001",
+      "user_id": "admin"
+    
+      // 可选：用户上传的附件/文档引用（v0 可先留空）
+      "attachments": [
+        // {"type":"file","file_id":"f_123","name":"spec.pdf"}
+      ]
+    }
+    
+    ```
+
+    
+
+  - authz: dict
+
+    ```json
+    {
+      // 鉴权信息
+      // 用户身份（必填）
+      "user_id": "u_123",
+    
+      // 用户角色（RBAC）
+      "roles": ["engineer"],
+    
+      // 用户组织/项目范围（用于过滤可访问知识）
+      "org_units": ["team-a", "project-x"],
+    
+      // 权限快照ID：用于审计复现（建议必填）
+      "perm_snapshot_id": "perm_20251227_001"
+    }
+    
+    ```
+
+  - plan: dict
+
+    ```json
+    {
+      // 路由结果：RouteNode 写入
+      "route": "DOC", // "DOC" | "SQL" | "CLARIFY"
+    
+      // 一句话意图（可选，但很有用）
+      "intent": "ask_policy_from_docs",
+    
+      // 当 route=CLARIFY 时给出澄清问题（v0 用一个问题就行）
+      "clarifying_questions": [
+        // "你是想查询内部文档内容，还是想统计数据库里的业务数据？"
+      ],
+    
+      // v0 简化：不做 subtasks；后续要做 HYBRID 再加
+      "validation": {
+        // ValidateEvidenceNode 写入
+        "ok": true,
+        "reason": null // "no_evidence" | "permission_denied" | null
+      }
+    }
+    
+    ```
+
+    
+
+  - tools: dict
+
+    ```json
+    {
+      // DOC RAG 工具的摘要（DocRAGToolNode 写入）
+      "rag": {
+        "query": "kubernetes deployment rolling update 默认策略是什么",
+        "top_k": 8,
+    
+        // 可选：权限/目录过滤摘要（具体规则别全塞进来，避免泄露）
+        "filters": {
+          "scope": ["team-a", "project-x"]
+        },
+    
+        // 本次 RAG 生成的 evidence_id 列表（用于定位）
+        "returned_evidence_ids": [
+          "doc:deploy_spec_v3:chunk_001:a1b2c3d4",
+          "doc:k8s_handbook:chunk_114:9f8e7d6c"
+        ]
+      },
+    
+      // SQL 工具摘要（SQLToolNode 写入；v0 合并版）
+      "sql": {
+        // 生成的 SQL（注意脱敏/避免写入敏感常量）
+        "generated_sql": "SELECT COUNT(*) AS cnt FROM users WHERE tenant_id=? AND created_at>=? AND created_at<? LIMIT 50",
+    
+        // 结果预览（v0 建议只放 1~2 行摘要）
+        "result_preview": "cnt=128",
+    
+        // SQL 产生的 evidence_id（如果有）
+        "returned_evidence_ids": [
+          "sql:q_20251227_0009:rowset:3c2b1a00"
+        ]
+      },
+    
+      // 可选：工具错误列表（v0 先留一个数组即可）
+      "errors": [
+        // {"tool":"sql_tool","type":"ValidationError","msg":"tenant/org filter is required"}
+      ]
+    }
+    
+    ```
+
+    
+
+  - draft: dict
+
+    ```json
+    {
+      // 生成的答案草稿
+      "answer": "根据内部部署规范，Deployment 的 rolling update 默认策略是 ...",
+    
+      // 引用：最简版只存 evidence_id；后面再加 span(start/end)
+      "citations": [
+        { "evidence_id": "doc:deploy_spec_v3:chunk_001:a1b2c3d4" },
+        { "evidence_id": "doc:k8s_handbook:chunk_114:9f8e7d6c" }
+      ],
+    
+      // 一个粗略置信度（0~1），v0 可先写死规则：有证据=0.7+
+      "confidence": 0.78,
+    
+      // 可选：后续追问建议（v0 可先不做）
+      "followups": [
+        // "你想查看对应的配置示例吗？"
+      ]
+    }
+    
+    ```
+
+    
+
+  - output: dict
+
+    ```json
+    {
+      // 最终答案文本（通常等于 draft.answer）
+      "final_answer": "根据内部部署规范，Deployment 的 rolling update 默认策略是 ...",
+    
+      // 最终引用（通常等于 draft.citations）
+      "final_citations": [
+        { "evidence_id": "doc:deploy_spec_v3:chunk_001:a1b2c3d4" },
+        { "evidence_id": "doc:k8s_handbook:chunk_114:9f8e7d6c" }
+      ],
+    
+      // 可选：为了前端渲染，把 evidence 的核心展示信息提前整理（避免前端再查）
+      "rendered_sources": [
+        {
+          "evidence_id": "doc:deploy_spec_v3:chunk_001:a1b2c3d4",
+          "title": "Internal Deployment Spec",
+          "page": 3,
+          "uri": "kb://team-a/deploy/spec"
+        }
+      ],
+    
+      // 可选：停止原因/结果状态（v0 简单几个枚举就够）
+      "stop_reason": "ok" // "ok" | "need_clarify" | "no_evidence" | "permission_denied" | "tool_error"
+    }
+    
+    ```
+
+    
+
+
+
+## 4.3 Node定义
+
+### 4.3.1 PreprocessNode
+
+**职责**：清洗用户 query，做轻量标准化（去多余空格/控制字符），可选语言检测
+
+读取:
+
+- `state["input"]["query"]`
+
+写入(覆盖):
+
+- `state[input]['normalized_query']`
+
+写入(追加):
+
+- `trace_steps += {node, action, timing_ms, status, ...}`
+
+
+
+### 4.3.2 LoadAuthzNode
+
+**职责**：加载权限上下文快照（先做“模拟/固定数据”也行），后续所有工具调用都带上它
+
+读取
+
+- `state["input"]["user_id"]`
+
+写入(覆盖)
+
+- `authz: {user_id, roles, org_units, perm_snapshot_id}`
+
+写入(追加)
+
+- `trace_steps += {node, action, timing_ms, status, ...}`
+
+
+
+### 4.3.3 RouteNode
+
+职责: 决定走DOC/SQL/CLARIFY
+
+- 出现"多少/统计/新增/上月/列表/排名/指标" => SQL
+- 出现"文档/规范/如何配置/默认策略/是什么" => DOC
+- 意图不明确 => ClARIFY
+- 请求越权，敏感数据，不在系统能力范围 => REFUSE
+
+使用基于LLM的意图识别来进行路由
+
+读取
+
+- `state["input"]["normalized_query"]`
+- `authz`
+
+
+
+写入(覆盖)
+
+- `state["plan"]["route"]`
+- `state["plan"]["intent"]`
+- `state["plan"]["clarifying_questions"]`
+
+
+
+写入(追加)
+
+- trace_steps
+
+
+
+### 4.3.4 ToolNode: DocToolNode
+
+职责: 检索 → 返回evidence, 把 evidence写入 evidence_items
+
+读取
+
+- `state["input"]["normalized_query"]`
+- `authz`
+
+
+
+写入 (覆盖)
+
+- `state["tools"]["rag"]: {query, top_k, filters, returned_evidence_ids}`
+
+
+
+写入 (追加)
+
+- `evidence_items += [EvidenceItem...]`
+- `tracesteps += ...`
+
+
+
+### 4.3.5 ToolNode: SQLToolNode
+
+职责: NL → SQL (简单模板/LLM) → 执行 → 把结果写成evidence_items
+
+**读取**
+
+- `input.normalized_query`
+- `authz`
+
+
+
+写入(覆盖)
+
+- `tools.sql: {generated_sql, result_preview, returned_evidence_ids}`
+
+
+
+写入(追加)
+
+- `evidence_items += [...]`
+
+
+
+SQL约束
+
+- 强制只读: 禁止`insert/update/delete/drop/alter`
+- 强制`LIMIT 50`
+- 强制带`tenant/org filter`检查
+
+
+
+### 4.3.6 ClarifyNode
+
+职责: 输出澄清问题
+
+读取
+
+- `state["plan"]["clarifying_questions"]`
+
+
+
+写入(覆盖)
+
+- `state["output"]["final_answer"]`
+
+
+
+写入(追加)
+
+- `trace_steps +=`
+
+
+
+### 4.3.7 ValidateEvidenceNode
+
+职责: 只做“够不够 + 能不能用”，保持简单
+
+- evidence 是否为空
+
+- 是否全是 deny/filtered
+
+
+
+读取
+
+- `state["evidence_items"]`
+- `state["plan"]["route"]`
+
+
+
+写入(覆盖)
+
+- `state["plan"]["validation"]`
+
+
+
+写入(追加)
+
+- `trace_steps += ...`
+
+
+
+### 4.3.8 SynthesizeNode
+
+职责: 根据evidence生成答案， 并产出citations(引用evidence_id)
+
+强制要求； 不允许无引用的断言; 证据不足就说明无法从已授权资料确认
+
+
+
+**读取**
+
+- `input.normalized_query`
+- `plan.route`
+- `evidence_items`
+- （可选）`messages`（最近 N 轮）
+
+**写入（覆盖）**
+
+- `draft: {answer, citations:[{evidence_id}], confidence}`
+- `output.final_answer`
+- `output.final_citations`
+
+**写入（追加）**
+
+- `trace_steps += ...`
 
